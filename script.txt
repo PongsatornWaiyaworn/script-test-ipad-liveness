@@ -1,0 +1,480 @@
+import SwiftUI
+import CoreML
+import Vision
+import UIKit
+import os.log
+
+// MARK: - Performance Metrics Model
+struct InferenceMetrics {
+    var inferenceTimeMs: Double = 0
+    var preprocessTimeMs: Double = 0
+    var totalTimeMs: Double = 0
+    var cpuUsageBefore: Double = 0
+    var cpuUsageAfter: Double = 0
+    var memoryUsedMB: Double = 0
+    var predictedClass: String = "-"
+    var confidence: Float = 0
+    var allClassScores: [(label: String, confidence: Float)] = []
+}
+
+// MARK: - Resource Monitor
+class ResourceMonitor {
+    static func getCPUUsage() -> Double {
+        var totalUsageOfCPU: Double = 0.0
+        var threadsList = UnsafeMutablePointer(mutating: [thread_act_t]())
+        var threadsCount = mach_msg_type_number_t(0)
+        let threadsResult = task_threads(mach_task_self_, &threadsList, &threadsCount)
+
+        if threadsResult == KERN_SUCCESS {
+            for index in 0..<threadsCount {
+                var threadInfo = thread_basic_info()
+                var threadInfoCount = mach_msg_type_number_t(THREAD_INFO_MAX)
+                let infoResult = withUnsafeMutablePointer(to: &threadInfo) {
+                    $0.withMemoryRebound(to: integer_t.self, capacity: 1) {
+                        thread_info(threadsList[Int(index)], thread_flavor_t(THREAD_BASIC_INFO), $0, &threadInfoCount)
+                    }
+                }
+                guard infoResult == KERN_SUCCESS else { break }
+                let threadBasicInfo = threadInfo as thread_basic_info
+                if threadBasicInfo.flags & TH_FLAGS_IDLE == 0 {
+                    totalUsageOfCPU += (Double(threadBasicInfo.cpu_usage) / Double(TH_USAGE_SCALE)) * 100.0
+                }
+            }
+        }
+        vm_deallocate(mach_task_self_, vm_address_t(UInt(bitPattern: threadsList)), vm_size_t(Int(threadsCount) * MemoryLayout<thread_t>.stride))
+        return totalUsageOfCPU
+    }
+
+    static func getMemoryUsageMB() -> Double {
+        var info = mach_task_basic_info()
+        var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size) / 4
+        let result = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: 1) {
+                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return 0 }
+        return Double(info.resident_size) / 1024.0 / 1024.0
+    }
+}
+
+// MARK: - Liveness Classifier
+class LivenessClassifier: ObservableObject {
+    @Published var metrics = InferenceMetrics()
+    @Published var isProcessing = false
+    @Published var errorMessage: String? = nil
+
+    // Vision request — lazily initialised with whatever .mlmodelc is bundled
+    private var vnRequest: VNCoreMLRequest?
+
+    // Label mapping — adjust to match YOUR model's output labels
+    // MobileNetV2 ImageNet labels will be replaced once you supply a real liveness model
+    private let livenessLabels = ["real", "spoof"]
+
+    init() {
+        setupModel()
+    }
+
+    private func setupModel() {
+        // ── Option A: load a bundled .mlmodelc ──────────────────────────────
+        // Uncomment and replace "YourLivenessModel" with the actual name:
+        //
+        // guard let modelURL = Bundle.main.url(forResource: "YourLivenessModel",
+        //                                       withExtension: "mlmodelc") else {
+        //     DispatchQueue.main.async { self.errorMessage = "Model file not found in bundle" }
+        //     return
+        // }
+        // do {
+        //     let mlModel = try MLModel(contentsOf: modelURL)
+        //     let vnModel = try VNCoreMLModel(for: mlModel)
+        //     vnRequest  = VNCoreMLRequest(model: vnModel)
+        //     vnRequest?.imageCropAndScaleOption = .centerCrop
+        // } catch {
+        //     DispatchQueue.main.async { self.errorMessage = "Model load error: \(error.localizedDescription)" }
+        // }
+
+        // ── Option B: demo mode (no model file needed) ──────────────────────
+        // Simulates inference so you can test the UI/metrics flow right away.
+        // Remove this block once you wire in a real model via Option A.
+        DispatchQueue.main.async {
+            self.errorMessage = "⚠️ Demo mode — no model loaded.\nSee setupModel() to attach your .mlmodelc file."
+        }
+    }
+
+    // MARK: - Main Analysis Entry Point
+    func analyzeImage(_ image: UIImage) {
+        guard !isProcessing else { return }
+        isProcessing = true
+        errorMessage = nil
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+
+            if self.vnRequest != nil {
+                self.runVisionInference(image)
+            } else {
+                self.runDemoInference(image)   // fallback when no model is loaded
+            }
+        }
+    }
+
+    // MARK: - Real Vision Inference
+    private func runVisionInference(_ image: UIImage) {
+        guard let request = vnRequest,
+              let cgImage = image.cgImage else {
+            finishWithError("Could not prepare image for inference")
+            return
+        }
+
+        var result = InferenceMetrics()
+        result.cpuUsageBefore = ResourceMonitor.getCPUUsage()
+
+        // Pre-process timing
+        let preStart = Date()
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        result.preprocessTimeMs = Date().timeIntervalSince(preStart) * 1000
+
+        // Inference timing
+        let inferStart = Date()
+        do {
+            try handler.perform([request])
+        } catch {
+            finishWithError("Inference error: \(error.localizedDescription)")
+            return
+        }
+        result.inferenceTimeMs = Date().timeIntervalSince(inferStart) * 1000
+        result.totalTimeMs = result.preprocessTimeMs + result.inferenceTimeMs
+
+        result.cpuUsageAfter = ResourceMonitor.getCPUUsage()
+        result.memoryUsedMB = ResourceMonitor.getMemoryUsageMB()
+
+        // Parse output
+        if let observations = request.results as? [VNClassificationObservation] {
+            result.allClassScores = observations.prefix(5).map { ($0.identifier, $0.confidence) }
+            if let top = observations.first {
+                result.predictedClass = top.identifier
+                result.confidence = top.confidence
+            }
+        }
+
+        finishWithResult(result)
+    }
+
+    // MARK: - Demo Inference (no model file)
+    private func runDemoInference(_ image: UIImage) {
+        var result = InferenceMetrics()
+        result.cpuUsageBefore = ResourceMonitor.getCPUUsage()
+
+        let preStart = Date()
+        _ = image.jpegData(compressionQuality: 0.8)   // simulate pre-process work
+        result.preprocessTimeMs = Date().timeIntervalSince(preStart) * 1000
+
+        let inferStart = Date()
+        Thread.sleep(forTimeInterval: Double.random(in: 0.08...0.25))   // simulate inference
+        result.inferenceTimeMs = Date().timeIntervalSince(inferStart) * 1000
+        result.totalTimeMs = result.preprocessTimeMs + result.inferenceTimeMs
+
+        result.cpuUsageAfter = ResourceMonitor.getCPUUsage()
+        result.memoryUsedMB = ResourceMonitor.getMemoryUsageMB()
+
+        // Random demo classification
+        let classes = [("real", Float.random(in: 0.70...0.99)),
+                       ("spoof", Float.random(in: 0.01...0.30))]
+        result.allClassScores = classes
+        result.predictedClass = classes[0].0
+        result.confidence = classes[0].1
+
+        finishWithResult(result)
+    }
+
+    private func finishWithResult(_ result: InferenceMetrics) {
+        DispatchQueue.main.async { [weak self] in
+            self?.metrics = result
+            self?.isProcessing = false
+        }
+    }
+
+    private func finishWithError(_ msg: String) {
+        DispatchQueue.main.async { [weak self] in
+            self?.errorMessage = msg
+            self?.isProcessing = false
+        }
+    }
+}
+
+// MARK: - Camera / Photo Picker
+struct ImagePicker: UIViewControllerRepresentable {
+    @Binding var selectedImage: UIImage?
+    @Environment(\.dismiss) var dismiss
+    var sourceType: UIImagePickerController.SourceType
+
+    func makeUIViewController(context: Context) -> UIImagePickerController {
+        let picker = UIImagePickerController()
+        picker.sourceType = sourceType
+        picker.delegate = context.coordinator
+        return picker
+    }
+    func updateUIViewController(_ uvc: UIImagePickerController, context: Context) {}
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    class Coordinator: NSObject, UINavigationControllerDelegate, UIImagePickerControllerDelegate {
+        let parent: ImagePicker
+        init(_ p: ImagePicker) { parent = p }
+        func imagePickerController(_ picker: UIImagePickerController,
+                                   didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]) {
+            parent.selectedImage = info[.originalImage] as? UIImage
+            parent.dismiss()
+        }
+        func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
+            parent.dismiss()
+        }
+    }
+}
+
+// MARK: - Metrics Card
+struct MetricCard: View {
+    let title: String
+    let value: String
+    let icon: String
+    var accent: Color = .blue
+
+    var body: some View {
+        VStack(spacing: 6) {
+            Image(systemName: icon)
+                .font(.title2)
+                .foregroundColor(accent)
+            Text(value)
+                .font(.headline).bold()
+            Text(title)
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(12)
+        .background(Color(.secondarySystemBackground))
+        .cornerRadius(12)
+    }
+}
+
+// MARK: - Main View
+struct ContentView: View {
+    @StateObject private var classifier = LivenessClassifier()
+    @State private var capturedImage: UIImage? = nil
+    @State private var showCamera = false
+    @State private var showPhotoPicker = false
+
+    private var resultColor: Color {
+        switch classifier.metrics.predictedClass.lowercased() {
+        case "real":  return .green
+        case "spoof": return .red
+        default:      return .gray
+        }
+    }
+
+    var body: some View {
+        NavigationView {
+            ScrollView {
+                VStack(spacing: 20) {
+
+                    // ── Error banner ─────────────────────────────────────────
+                    if let err = classifier.errorMessage {
+                        Text(err)
+                            .font(.footnote)
+                            .foregroundColor(.orange)
+                            .multilineTextAlignment(.center)
+                            .padding(10)
+                            .background(Color.orange.opacity(0.1))
+                            .cornerRadius(10)
+                            .padding(.horizontal)
+                    }
+
+                    // ── Preview ──────────────────────────────────────────────
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 16)
+                            .fill(Color(.tertiarySystemBackground))
+                            .frame(height: 300)
+
+                        if let img = capturedImage {
+                            Image(uiImage: img)
+                                .resizable()
+                                .scaledToFill()
+                                .frame(height: 300)
+                                .clipped()
+                                .cornerRadius(16)
+                        } else {
+                            VStack(spacing: 8) {
+                                Image(systemName: "camera.viewfinder")
+                                    .font(.system(size: 60))
+                                    .foregroundColor(.secondary)
+                                Text("ถ่ายรูปหรือเลือกจาก Library")
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+
+                        if classifier.isProcessing {
+                            RoundedRectangle(cornerRadius: 16)
+                                .fill(Color.black.opacity(0.45))
+                                .frame(height: 300)
+                            VStack(spacing: 10) {
+                                ProgressView().tint(.white).scaleEffect(1.4)
+                                Text("กำลังประมวลผล…").foregroundColor(.white).font(.headline)
+                            }
+                        }
+                    }
+                    .padding(.horizontal)
+
+                    // ── Capture buttons ──────────────────────────────────────
+                    HStack(spacing: 12) {
+                        Button {
+                            if UIImagePickerController.isSourceTypeAvailable(.camera) {
+                                showCamera = true
+                            }
+                        } label: {
+                            Label("ถ่ายรูป", systemImage: "camera.fill")
+                                .frame(maxWidth: .infinity)
+                                .padding()
+                                .background(Color.blue)
+                                .foregroundColor(.white)
+                                .cornerRadius(12)
+                        }
+
+                        Button { showPhotoPicker = true } label: {
+                            Label("Library", systemImage: "photo.on.rectangle")
+                                .frame(maxWidth: .infinity)
+                                .padding()
+                                .background(Color.purple)
+                                .foregroundColor(.white)
+                                .cornerRadius(12)
+                        }
+                    }
+                    .padding(.horizontal)
+
+                    // ── Analyse button ───────────────────────────────────────
+                    if capturedImage != nil && !classifier.isProcessing {
+                        Button {
+                            guard let img = capturedImage else { return }
+                            classifier.analyzeImage(img)
+                        } label: {
+                            Label("วิเคราะห์ภาพ", systemImage: "waveform.path.ecg")
+                                .frame(maxWidth: .infinity)
+                                .padding()
+                                .background(Color.green)
+                                .foregroundColor(.white)
+                                .cornerRadius(12)
+                                .bold()
+                        }
+                        .padding(.horizontal)
+                    }
+
+                    // ── Result banner ─────────────────────────────────────────
+                    if classifier.metrics.predictedClass != "-" {
+                        VStack(spacing: 4) {
+                            Text(classifier.metrics.predictedClass.uppercased())
+                                .font(.system(size: 34, weight: .black))
+                                .foregroundColor(resultColor)
+                            Text(String(format: "Confidence: %.1f%%",
+                                        classifier.metrics.confidence * 100))
+                                .font(.title3)
+                                .foregroundColor(.secondary)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding()
+                        .background(resultColor.opacity(0.1))
+                        .cornerRadius(16)
+                        .padding(.horizontal)
+                    }
+
+                    // ── Metrics grid ─────────────────────────────────────────
+                    if classifier.metrics.totalTimeMs > 0 {
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text("⚡ Performance Metrics")
+                                .font(.headline)
+                                .padding(.horizontal)
+
+                            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())],
+                                      spacing: 10) {
+                                MetricCard(title: "Pre-process",
+                                           value: String(format: "%.1f ms", classifier.metrics.preprocessTimeMs),
+                                           icon: "photo.circle", accent: .orange)
+                                MetricCard(title: "Inference",
+                                           value: String(format: "%.1f ms", classifier.metrics.inferenceTimeMs),
+                                           icon: "cpu", accent: .blue)
+                                MetricCard(title: "Total",
+                                           value: String(format: "%.1f ms", classifier.metrics.totalTimeMs),
+                                           icon: "timer", accent: .green)
+                                MetricCard(title: "CPU Before",
+                                           value: String(format: "%.1f%%", classifier.metrics.cpuUsageBefore),
+                                           icon: "speedometer", accent: .teal)
+                                MetricCard(title: "CPU After",
+                                           value: String(format: "%.1f%%", classifier.metrics.cpuUsageAfter),
+                                           icon: "speedometer", accent: .red)
+                                MetricCard(title: "Memory",
+                                           value: String(format: "%.1f MB", classifier.metrics.memoryUsedMB),
+                                           icon: "memorychip", accent: .purple)
+                            }
+                            .padding(.horizontal)
+
+                            // All class scores
+                            if !classifier.metrics.allClassScores.isEmpty {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Text("Class Scores")
+                                        .font(.subheadline).bold()
+                                        .foregroundColor(.secondary)
+
+                                    ForEach(classifier.metrics.allClassScores, id: \.label) { item in
+                                        HStack {
+                                            Text(item.label)
+                                                .frame(width: 120, alignment: .leading)
+                                                .font(.footnote)
+                                            GeometryReader { geo in
+                                                ZStack(alignment: .leading) {
+                                                    Capsule().fill(Color(.systemFill))
+                                                    Capsule()
+                                                        .fill(item.label == classifier.metrics.predictedClass
+                                                              ? resultColor : Color.blue.opacity(0.6))
+                                                        .frame(width: geo.size.width * CGFloat(item.confidence))
+                                                }
+                                            }
+                                            .frame(height: 10)
+                                            Text(String(format: "%.1f%%", item.confidence * 100))
+                                                .font(.caption).bold()
+                                                .frame(width: 52, alignment: .trailing)
+                                        }
+                                    }
+                                }
+                                .padding()
+                                .background(Color(.secondarySystemBackground))
+                                .cornerRadius(12)
+                                .padding(.horizontal)
+                            }
+                        }
+                    }
+
+                    Spacer(minLength: 40)
+                }
+                .padding(.top)
+            }
+            .navigationTitle("Liveness Detection")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+        .navigationViewStyle(.stack)
+        .sheet(isPresented: $showCamera) {
+            ImagePicker(selectedImage: $capturedImage, sourceType: .camera)
+        }
+        .sheet(isPresented: $showPhotoPicker) {
+            ImagePicker(selectedImage: $capturedImage, sourceType: .photoLibrary)
+        }
+    }
+}
+
+// MARK: - App Entry Point
+@main
+struct LivenessTestApp: App {
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+        }
+    }
+}
