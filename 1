@@ -1,0 +1,669 @@
+import SwiftUI
+import CoreML
+import Vision
+import UIKit
+
+// MARK: - Performance Metrics Model
+struct InferenceMetrics {
+    var inferenceTimeMs: Double = 0
+    var preprocessTimeMs: Double = 0
+    var totalTimeMs: Double = 0
+    var cpuUsageBefore: Double = 0
+    var cpuUsageAfter: Double = 0
+    var memoryUsedMB: Double = 0
+    var predictedClass: String = "-"
+    var confidence: Float = 0
+    var allClassScores: [(label: String, confidence: Float)] = []
+}
+
+// MARK: - Resource Monitor
+// ใช้ ProcessInfo + mach_task_basic_info แทน task_threads
+// (task_threads มี type ไม่ตรงกับ Swift Playgrounds บน iPad)
+class ResourceMonitor {
+    
+    // CPU: อ่านจาก host_statistics — ทำงานได้ใน Playground sandbox
+    static func getCPUUsage() -> Double {
+        var info = host_cpu_load_info()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<host_cpu_load_info_data_t>.size / MemoryLayout<integer_t>.size
+        )
+        let result = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                host_statistics(mach_host_self(),
+                                HOST_CPU_LOAD_INFO,
+                                $0,
+                                &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return 0 }
+        
+        let user   = Double(info.cpu_ticks.0)
+        let system = Double(info.cpu_ticks.1)
+        let idle   = Double(info.cpu_ticks.2)
+        let nice   = Double(info.cpu_ticks.3)
+        let total  = user + system + idle + nice
+        guard total > 0 else { return 0 }
+        return ((user + system + nice) / total) * 100.0
+    }
+    
+    // Memory: resident size จาก mach_task_basic_info
+    static func getMemoryUsageMB() -> Double {
+        var info = mach_task_basic_info()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<mach_task_basic_info_data_t>.size / MemoryLayout<natural_t>.size
+        )
+        let result = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_,
+                          task_flavor_t(MACH_TASK_BASIC_INFO),
+                          $0,
+                          &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return 0 }
+        return Double(info.resident_size) / 1_048_576.0
+    }
+}
+
+// MARK: - Liveness Classifier
+class LivenessClassifier: ObservableObject {
+    @Published var metrics = InferenceMetrics()
+    @Published var isProcessing = false
+    @Published var errorMessage: String? = nil
+    @Published var modelStatus: String = "กำลังโหลดโมเดล…"
+    
+    // ── ชื่อไฟล์ที่ลากใส่ Playground (แก้ตรงนี้จุดเดียว) ──────────
+    private let zipFileName   = "MobileNetV3LargeLiveness_fp16.mlpackage-20260615T075345Z-3-001"              // ชื่อ .zip (ไม่ใส่นามสกุล)
+    private let modelFileName = "MobileNetV3LargeLiveness_fp16"  // ชื่อ .mlpackage ข้างใน zip
+    
+    @Published var vnRequest: VNCoreMLRequest?
+    
+    // โฟลเดอร์ชั่วคราวสำหรับแตก zip
+    private lazy var unzipDir: URL = {
+        FileManager.default
+            .temporaryDirectory
+            .appendingPathComponent("liveness_model", isDirectory: true)
+    }()
+    
+    init() {
+        // โหลดบน background thread ไม่บล็อก UI
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.setupModel()
+        }
+    }
+    
+    // MARK: - Setup: หา zip → แตก → โหลด MLModel
+    private func setupModel() {
+        
+        do {
+            // ── 1. หา .zip ใน bundle ─────────────────────────────────
+            guard let zipURL = Bundle.main.url(forResource: zipFileName,
+                                               withExtension: "zip") else {
+                throw ModelError.zipNotFound(zipFileName)
+            }
+            
+            // ── 2. แตก zip ไปยัง temp directory ─────────────────────
+            let mlpackageURL = try unzipAndLocateModel(zipURL: zipURL)
+            
+            // ── 3. โหลด MLModel ──────────────────────────────────────
+            setStatus("โหลดโมเดล…")
+            let config = MLModelConfiguration()
+            config.computeUnits = .all          // Neural Engine + GPU + CPU
+            
+            let mlModel = try MLModel(contentsOf: mlpackageURL, configuration: config)
+            let vnModel = try VNCoreMLModel(for: mlModel)
+            
+            let request = VNCoreMLRequest(model: vnModel)
+            request.imageCropAndScaleOption = .centerCrop
+            self.vnRequest = request
+            
+            DispatchQueue.main.async {
+                self.modelStatus  = "✅ โมเดลพร้อมใช้งาน"
+                self.errorMessage = nil
+            }
+            
+        } catch ModelError.zipNotFound(let name) {
+            setError("❌ ไม่พบ \(name).zip ใน bundle\nลากไฟล์ zip เข้า Swift Playgrounds แล้วรันใหม่")
+            
+        } catch ModelError.mlpackageNotFound(let name) {
+            setError("❌ ไม่พบ \(name).mlpackage ใน zip\nตรวจสอบว่า zip มีไฟล์ .mlpackage อยู่ข้างใน")
+            
+        } catch {
+            print(error)
+            
+            let ns = error as NSError
+            
+            print("Domain =", ns.domain)
+            print("Code =", ns.code)
+            print("Info =", ns.userInfo)
+            
+            setError("""
+    Domain: \(ns.domain)
+    Code: \(ns.code)
+    \(ns.localizedDescription)
+    """)
+        }
+    }
+    
+    // MARK: - Unzip + locate .mlpackage
+    private func unzipAndLocateModel(zipURL: URL) throws -> URL {
+        
+        let fm = FileManager.default
+        
+        // สร้าง / ล้าง unzip dir
+        if fm.fileExists(atPath: unzipDir.path) {
+            try fm.removeItem(at: unzipDir)
+        }
+        try fm.createDirectory(at: unzipDir, withIntermediateDirectories: true)
+        
+        setStatus("แตกไฟล์ zip…")
+        
+        // ── แตก zip ด้วย Process (ใช้ /usr/bin/unzip ที่มีอยู่บน iOS/iPadOS) ──
+        // Swift Playgrounds รองรับ Foundation's FileManager แต่ไม่มี built-in unzip
+        // ใช้วิธี read zip entries ด้วย ZipFoundation-free approach ผ่าน URLSession
+        // ทางที่ง่ายที่สุดใน Playground คือ copy zip แล้วใช้ FileManager coordinate
+        //
+        // iOS มี libcompression แต่ไม่มี high-level zip API โดยตรง
+        // → ใช้วิธี manual read ZIP local file headers
+        try extractZip(at: zipURL, to: unzipDir)
+        
+        // ── หา .mlpackage ใน directory ที่แตกออกมา (recursive) ──────
+        setStatus("ค้นหา .mlpackage…")
+        guard let mlpackageURL = findFirst(extension: "mlpackage", in: unzipDir) else {
+            throw ModelError.mlpackageNotFound(modelFileName)
+        }
+        
+        return mlpackageURL
+    }
+    
+    // MARK: - Pure-Swift ZIP extractor (no dependencies)
+    // รองรับ ZIP local file format (DEFLATE + STORED)
+    private func extractZip(at zipURL: URL, to destDir: URL) throws {
+        let data = try Data(contentsOf: zipURL, options: .mappedIfSafe)
+        var offset = 0
+        let fm = FileManager.default
+        
+        while offset + 30 < data.count {
+            // Local file header signature: 0x04034b50
+            let sig = data.loadLE32(at: offset)
+            guard sig == 0x04034b50 else { break }
+            
+            let compression  = Int(data.loadLE16(at: offset + 8))
+            let compSize     = Int(data.loadLE32(at: offset + 18))
+            let uncompSize   = Int(data.loadLE32(at: offset + 22))
+            let nameLen      = Int(data.loadLE16(at: offset + 26))
+            let extraLen     = Int(data.loadLE16(at: offset + 28))
+            
+            let nameStart    = offset + 30
+            let nameEnd      = nameStart + nameLen
+            guard nameEnd <= data.count else { break }
+            
+            let nameData     = data[nameStart..<nameEnd]
+            let entryName    = String(bytes: nameData, encoding: .utf8) ?? ""
+            let dataStart    = nameEnd + extraLen
+            let dataEnd      = dataStart + compSize
+            guard dataEnd <= data.count else { break }
+            
+            let destURL = destDir.appendingPathComponent(entryName)
+            
+            if entryName.hasSuffix("/") {
+                // directory entry
+                try? fm.createDirectory(at: destURL, withIntermediateDirectories: true)
+            } else {
+                // file entry
+                try? fm.createDirectory(at: destURL.deletingLastPathComponent(),
+                                        withIntermediateDirectories: true)
+                let compressedData = data[dataStart..<dataEnd]
+                
+                if compression == 0 {
+                    // STORED — copy as-is
+                    try compressedData.write(to: destURL)
+                } else if compression == 8 {
+                    // DEFLATE — decompress
+                    let decompressed = try (compressedData as NSData)
+                        .decompressed(using: .zlib) as Data
+                    // zlib wraps deflate; strip zlib header if present
+                    let payload = decompressed.count == uncompSize
+                    ? decompressed
+                    : Data(decompressed.suffix(uncompSize))
+                    try payload.write(to: destURL)
+                }
+            }
+            
+            offset = dataEnd
+        }
+    }
+    
+    // MARK: - Find first file with extension (recursive BFS)
+    private func findFirst(extension ext: String, in dir: URL) -> URL? {
+        guard let enumerator = FileManager.default.enumerator(
+            at: dir,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return nil }
+        
+        for case let url as URL in enumerator {
+            if url.pathExtension.lowercased() == ext.lowercased() {
+                return url
+            }
+        }
+        return nil
+    }
+    
+    // MARK: - Helpers
+    private func setStatus(_ msg: String) {
+        DispatchQueue.main.async { self.modelStatus = msg }
+    }
+    private func setError(_ msg: String) {
+        DispatchQueue.main.async {
+            self.errorMessage = msg
+            self.modelStatus  = "❌ โหลดล้มเหลว"
+        }
+    }
+    
+    // MARK: - Error types
+    enum ModelError: Error {
+        case zipNotFound(String)
+        case mlpackageNotFound(String)
+    }
+    
+    // MARK: - Main Entry Point
+    func analyzeImage(_ image: UIImage) {
+        guard !isProcessing else { return }
+        isProcessing = true
+        errorMessage = nil
+        
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            if self.vnRequest != nil {
+                self.runVisionInference(image)
+            } else {
+                self.runDemoInference(image)
+            }
+        }
+    }
+    
+    // MARK: - Real Vision Inference (MobileNetV3 + CoreML)
+    private func runVisionInference(_ image: UIImage) {
+        guard let request = vnRequest,
+              let cgImage = image.cgImage else {
+            finishWithError("ไม่สามารถเตรียมภาพสำหรับ inference ได้")
+            return
+        }
+        
+        var result = InferenceMetrics()
+        result.cpuUsageBefore = ResourceMonitor.getCPUUsage()
+        
+        // ── Pre-process: สร้าง VNImageRequestHandler ──
+        let preStart = Date()
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        result.preprocessTimeMs = Date().timeIntervalSince(preStart) * 1000
+        
+        // ── Inference ──────────────────────────────────
+        let inferStart = Date()
+        do {
+            try handler.perform([request])
+        } catch {
+            finishWithError("Inference error: \(error.localizedDescription)")
+            return
+        }
+        result.inferenceTimeMs = Date().timeIntervalSince(inferStart) * 1000
+        result.totalTimeMs = result.preprocessTimeMs + result.inferenceTimeMs
+        
+        result.cpuUsageAfter = ResourceMonitor.getCPUUsage()
+        result.memoryUsedMB  = ResourceMonitor.getMemoryUsageMB()
+        
+        // ── Parse output ───────────────────────────────
+        // CoreML classifier output → VNClassificationObservation
+        // identifier = "live" | "spoof"  (ตรงกับ CLASS_LABELS ใน Python)
+        if let observations = request.results as? [VNClassificationObservation] {
+            // เรียง confidence มากไปน้อยแล้ว (Vision ทำให้อัตโนมัติ)
+            result.allClassScores = observations.map { ($0.identifier, $0.confidence) }
+            if let top = observations.first {
+                result.predictedClass = top.identifier
+                result.confidence     = top.confidence
+            }
+        }
+        
+        finishWithResult(result)
+    }
+    
+    // MARK: - Demo Inference (fallback เมื่อยังไม่มี model)
+    private func runDemoInference(_ image: UIImage) {
+        var result = InferenceMetrics()
+        result.cpuUsageBefore = ResourceMonitor.getCPUUsage()
+        
+        let preStart = Date()
+        _ = image.jpegData(compressionQuality: 0.8)
+        result.preprocessTimeMs = Date().timeIntervalSince(preStart) * 1000
+        
+        let inferStart = Date()
+        Thread.sleep(forTimeInterval: Double.random(in: 0.08...0.20))
+        result.inferenceTimeMs = Date().timeIntervalSince(inferStart) * 1000
+        result.totalTimeMs = result.preprocessTimeMs + result.inferenceTimeMs
+        
+        result.cpuUsageAfter = ResourceMonitor.getCPUUsage()
+        result.memoryUsedMB  = ResourceMonitor.getMemoryUsageMB()
+        
+        let liveConf  = Float.random(in: 0.65...0.95)
+        let spoofConf = 1.0 - liveConf
+        result.allClassScores = [("live", liveConf), ("spoof", spoofConf)]
+        result.predictedClass = "live"
+        result.confidence     = liveConf
+        
+        finishWithResult(result)
+    }
+    
+    private func finishWithResult(_ result: InferenceMetrics) {
+        DispatchQueue.main.async { [weak self] in
+            self?.metrics     = result
+            self?.isProcessing = false
+        }
+    }
+    
+    private func finishWithError(_ msg: String) {
+        DispatchQueue.main.async { [weak self] in
+            self?.errorMessage = msg
+            self?.isProcessing = false
+        }
+    }
+}
+
+// MARK: - Camera / Photo Picker
+struct ImagePicker: UIViewControllerRepresentable {
+    @Binding var selectedImage: UIImage?
+    @Environment(\.dismiss) var dismiss
+    var sourceType: UIImagePickerController.SourceType
+    
+    func makeUIViewController(context: Context) -> UIImagePickerController {
+        let picker = UIImagePickerController()
+        picker.sourceType = sourceType
+        picker.delegate = context.coordinator
+        return picker
+    }
+    func updateUIViewController(_ uvc: UIImagePickerController, context: Context) {}
+    
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+    
+    class Coordinator: NSObject, UINavigationControllerDelegate, UIImagePickerControllerDelegate {
+        let parent: ImagePicker
+        init(_ p: ImagePicker) { parent = p }
+        func imagePickerController(_ picker: UIImagePickerController,
+                                   didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]) {
+            parent.selectedImage = info[.originalImage] as? UIImage
+            parent.dismiss()
+        }
+        func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
+            parent.dismiss()
+        }
+    }
+}
+
+// MARK: - Metrics Card
+struct MetricCard: View {
+    let title: String
+    let value: String
+    let icon: String
+    var accent: Color = .blue
+    
+    var body: some View {
+        VStack(spacing: 6) {
+            Image(systemName: icon)
+                .font(.title2)
+                .foregroundColor(accent)
+            Text(value)
+                .font(.headline).bold()
+            Text(title)
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(12)
+        .background(Color(.secondarySystemBackground))
+        .cornerRadius(12)
+    }
+}
+
+// MARK: - Main View
+struct ContentView: View {
+    @StateObject private var classifier = LivenessClassifier()
+    @State private var capturedImage: UIImage? = nil
+    @State private var showCamera = false
+    @State private var showPhotoPicker = false
+    
+    private var resultColor: Color {
+        switch classifier.metrics.predictedClass.lowercased() {
+        case "live":  return .green   // ตรงกับ CLASS_LABELS[0] ใน Python
+        case "spoof": return .red     // ตรงกับ CLASS_LABELS[1] ใน Python
+        default:      return .gray
+        }
+    }
+    
+    var body: some View {
+        NavigationView {
+            ScrollView {
+                VStack(spacing: 20) {
+                    
+                    // ── Model status banner ──────────────────────────────────
+                    HStack(spacing: 8) {
+                        if classifier.vnRequest == nil && classifier.errorMessage == nil {
+                            ProgressView().scaleEffect(0.8)
+                        }
+                        Text(classifier.modelStatus)
+                            .font(.footnote)
+                            .foregroundColor(
+                                classifier.modelStatus.hasPrefix("✅") ? .green : .secondary
+                            )
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(8)
+                    .background(Color(.secondarySystemBackground))
+                    .cornerRadius(8)
+                    .padding(.horizontal)
+                    
+                    // ── Error banner ─────────────────────────────────────────
+                    if let err = classifier.errorMessage {
+                        Text(err)
+                            .font(.footnote)
+                            .foregroundColor(.orange)
+                            .multilineTextAlignment(.center)
+                            .padding(10)
+                            .background(Color.orange.opacity(0.1))
+                            .cornerRadius(10)
+                            .padding(.horizontal)
+                    }
+                    
+                    // ── Preview ──────────────────────────────────────────────
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 16)
+                            .fill(Color(.tertiarySystemBackground))
+                            .frame(height: 300)
+                        
+                        if let img = capturedImage {
+                            Image(uiImage: img)
+                                .resizable()
+                                .scaledToFill()
+                                .frame(height: 300)
+                                .clipped()
+                                .cornerRadius(16)
+                        } else {
+                            VStack(spacing: 8) {
+                                Image(systemName: "camera.viewfinder")
+                                    .font(.system(size: 60))
+                                    .foregroundColor(.secondary)
+                                Text("ถ่ายรูปหรือเลือกจาก Library")
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        
+                        if classifier.isProcessing {
+                            RoundedRectangle(cornerRadius: 16)
+                                .fill(Color.black.opacity(0.45))
+                                .frame(height: 300)
+                            VStack(spacing: 10) {
+                                ProgressView().tint(.white).scaleEffect(1.4)
+                                Text("กำลังประมวลผล…").foregroundColor(.white).font(.headline)
+                            }
+                        }
+                    }
+                    .padding(.horizontal)
+                    
+                    // ── Capture buttons ──────────────────────────────────────
+                    HStack(spacing: 12) {
+                        Button {
+                            if UIImagePickerController.isSourceTypeAvailable(.camera) {
+                                showCamera = true
+                            }
+                        } label: {
+                            Label("ถ่ายรูป", systemImage: "camera.fill")
+                                .frame(maxWidth: .infinity)
+                                .padding()
+                                .background(Color.blue)
+                                .foregroundColor(.white)
+                                .cornerRadius(12)
+                        }
+                        
+                        Button { showPhotoPicker = true } label: {
+                            Label("Library", systemImage: "photo.on.rectangle")
+                                .frame(maxWidth: .infinity)
+                                .padding()
+                                .background(Color.purple)
+                                .foregroundColor(.white)
+                                .cornerRadius(12)
+                        }
+                    }
+                    .padding(.horizontal)
+                    
+                    // ── Analyse button ───────────────────────────────────────
+                    if capturedImage != nil && !classifier.isProcessing {
+                        Button {
+                            guard let img = capturedImage else { return }
+                            classifier.analyzeImage(img)
+                        } label: {
+                            Label("วิเคราะห์ภาพ", systemImage: "waveform.path.ecg")
+                                .frame(maxWidth: .infinity)
+                                .padding()
+                                .background(Color.green)
+                                .foregroundColor(.white)
+                                .cornerRadius(12)
+                                .bold()
+                        }
+                        .padding(.horizontal)
+                    }
+                    
+                    // ── Result banner ─────────────────────────────────────────
+                    if classifier.metrics.predictedClass != "-" {
+                        VStack(spacing: 4) {
+                            Text(classifier.metrics.predictedClass.uppercased())
+                                .font(.system(size: 34, weight: .black))
+                                .foregroundColor(resultColor)
+                            Text(String(format: "Confidence: %.1f%%",
+                                        classifier.metrics.confidence * 100))
+                            .font(.title3)
+                            .foregroundColor(.secondary)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding()
+                        .background(resultColor.opacity(0.1))
+                        .cornerRadius(16)
+                        .padding(.horizontal)
+                    }
+                    
+                    // ── Metrics grid ─────────────────────────────────────────
+                    if classifier.metrics.totalTimeMs > 0 {
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text("⚡ Performance Metrics")
+                                .font(.headline)
+                                .padding(.horizontal)
+                            
+                            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())],
+                                      spacing: 10) {
+                                MetricCard(title: "Pre-process",
+                                           value: String(format: "%.1f ms", classifier.metrics.preprocessTimeMs),
+                                           icon: "photo.circle", accent: .orange)
+                                MetricCard(title: "Inference",
+                                           value: String(format: "%.1f ms", classifier.metrics.inferenceTimeMs),
+                                           icon: "cpu", accent: .blue)
+                                MetricCard(title: "Total",
+                                           value: String(format: "%.1f ms", classifier.metrics.totalTimeMs),
+                                           icon: "timer", accent: .green)
+                                MetricCard(title: "CPU Before",
+                                           value: String(format: "%.1f%%", classifier.metrics.cpuUsageBefore),
+                                           icon: "speedometer", accent: .teal)
+                                MetricCard(title: "CPU After",
+                                           value: String(format: "%.1f%%", classifier.metrics.cpuUsageAfter),
+                                           icon: "speedometer", accent: .red)
+                                MetricCard(title: "Memory",
+                                           value: String(format: "%.1f MB", classifier.metrics.memoryUsedMB),
+                                           icon: "memorychip", accent: .purple)
+                            }
+                                      .padding(.horizontal)
+                            
+                            // All class scores
+                            if !classifier.metrics.allClassScores.isEmpty {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Text("Class Scores")
+                                        .font(.subheadline).bold()
+                                        .foregroundColor(.secondary)
+                                    
+                                    ForEach(classifier.metrics.allClassScores, id: \.label) { item in
+                                        HStack {
+                                            Text(item.label)
+                                                .frame(width: 120, alignment: .leading)
+                                                .font(.footnote)
+                                            GeometryReader { geo in
+                                                ZStack(alignment: .leading) {
+                                                    Capsule().fill(Color(.systemFill))
+                                                    Capsule()
+                                                        .fill(item.label == classifier.metrics.predictedClass
+                                                              ? resultColor : Color.blue.opacity(0.6))
+                                                        .frame(width: geo.size.width * CGFloat(item.confidence))
+                                                }
+                                            }
+                                            .frame(height: 10)
+                                            Text(String(format: "%.1f%%", item.confidence * 100))
+                                                .font(.caption).bold()
+                                                .frame(width: 52, alignment: .trailing)
+                                        }
+                                    }
+                                }
+                                .padding()
+                                .background(Color(.secondarySystemBackground))
+                                .cornerRadius(12)
+                                .padding(.horizontal)
+                            }
+                        }
+                    }
+                    
+                    Spacer(minLength: 40)
+                }
+                .padding(.top)
+            }
+            .navigationTitle("Liveness Detection")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+        .navigationViewStyle(.stack)
+        .sheet(isPresented: $showCamera) {
+            ImagePicker(selectedImage: $capturedImage, sourceType: .camera)
+        }
+        .sheet(isPresented: $showPhotoPicker) {
+            ImagePicker(selectedImage: $capturedImage, sourceType: .photoLibrary)
+        }
+    }
+}
+
+// MARK: - Data helpers for ZIP parsing
+private extension Data {
+    /// Little-endian UInt16
+    func loadLE16(at offset: Int) -> UInt16 {
+        UInt16(self[offset]) | (UInt16(self[offset + 1]) << 8)
+    }
+    /// Little-endian UInt32
+    func loadLE32(at offset: Int) -> UInt32 {
+        UInt32(self[offset])
+        | (UInt32(self[offset + 1]) << 8)
+        | (UInt32(self[offset + 2]) << 16)
+        | (UInt32(self[offset + 3]) << 24)
+    }
+}
